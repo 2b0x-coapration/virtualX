@@ -3,7 +3,7 @@
 A small GTK app for Linux with two buttons: **Upload ISO** and **Launch**.
 Upload lets you pick any bootable `.iso` file from your computer. Launch boots
 that ISO in a real QEMU virtual machine and opens it in a SPICE display
-window, so you can use it like a real machine you can even get it from out site https://virtuallX.freedev.app
+window, so you can use it like a real machine you can even get it from out site https://virtualx.xo.je
 
 ## Requirements
 
