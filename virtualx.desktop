@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VirtualX
+Comment=Upload an ISO and run it as a virtual machine
+Exec=virtualx
+Icon=virtualx
+Terminal=false
+Categories=System;Emulator;Utility;

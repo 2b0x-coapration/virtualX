@@ -1,0 +1,12 @@
+Package: virtualx
+Version: 2.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-gi, gir1.2-gtk-3.0, qemu-system-x86, virt-viewer
+Maintainer: VirtualX <noreply@example.com>
+Description: Run any ISO image as a virtual machine
+ VirtualX is a small GTK app with two buttons: Upload ISO and Launch.
+ Upload lets you pick any bootable .iso file from your computer.
+ Launch boots that ISO in a real QEMU virtual machine and opens it
+ in a SPICE display window, so you can use it like a real machine.

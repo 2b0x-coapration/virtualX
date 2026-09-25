@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+VirtualX - a simple virtual machine launcher.
+
+Lets the user pick any .iso image and boots it in a real QEMU virtual
+machine, displayed through SPICE (via remote-viewer) for smooth
+mouse/graphics performance. Works with any bootable ISO the user
+supplies, including Android-x86 style images, Linux live CDs, etc.
+"""
+
+import os
+import shutil
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+APP_TITLE = "VirtualX"
+SPICE_PORT = 5930
+
+
+def has_kvm():
+    return os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+def find_binary(name):
+    return shutil.which(name)
+
+
+class VirtualXWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title=APP_TITLE)
+        self.set_default_size(460, 320)
+        self.set_border_width(24)
+        self.iso_path = None
+        self.qemu_proc = None
+        self.viewer_proc = None
+
+        self._apply_css()
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self.add(root)
+
+        header = Gtk.Label()
+        header.set_markup("<span size='xx-large' weight='bold'>VirtualX</span>")
+        header.set_halign(Gtk.Align.START)
+        root.pack_start(header, False, False, 0)
+
+        subtitle = Gtk.Label(label="Upload any bootable ISO and run it as a real virtual machine.")
+        subtitle.set_halign(Gtk.Align.START)
+        subtitle.set_line_wrap(True)
+        subtitle.get_style_context().add_class("subtitle")
+        root.pack_start(subtitle, False, False, 0)
+
+        self.file_label = Gtk.Label(label="No ISO selected")
+        self.file_label.set_halign(Gtk.Align.START)
+        self.file_label.get_style_context().add_class("file-label")
+        root.pack_start(self.file_label, False, False, 6)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        btn_box.set_halign(Gtk.Align.START)
+        root.pack_start(btn_box, False, False, 0)
+
+        self.upload_btn = Gtk.Button(label="Upload ISO")
+        self.upload_btn.get_style_context().add_class("upload-btn")
+        self.upload_btn.connect("clicked", self.on_upload_clicked)
+        btn_box.pack_start(self.upload_btn, False, False, 0)
+
+        self.launch_btn = Gtk.Button(label="Launch")
+        self.launch_btn.get_style_context().add_class("launch-btn")
+        self.launch_btn.set_sensitive(False)
+        self.launch_btn.connect("clicked", self.on_launch_clicked)
+        btn_box.pack_start(self.launch_btn, False, False, 0)
+
+        self.status_label = Gtk.Label(label="")
+        self.status_label.set_halign(Gtk.Align.START)
+        self.status_label.set_line_wrap(True)
+        root.pack_start(self.status_label, False, False, 12)
+
+        kvm_note = "Hardware acceleration (KVM) detected — VMs will run fast." if has_kvm() \
+            else "No KVM access detected — VMs will run in software mode (slower, but works)."
+        note = Gtk.Label(label=kvm_note)
+        note.set_halign(Gtk.Align.START)
+        note.get_style_context().add_class("note")
+        note.set_line_wrap(True)
+        root.pack_end(note, False, False, 0)
+
+        self.connect("destroy", self.on_destroy)
+
+    def _apply_css(self):
+        css = b"""
+        window { background-color: #14162a; }
+        label { color: #e8e9f5; }
+        .subtitle { color: #9a9dc2; font-size: 13px; }
+        .file-label { color: #63c6ff; font-family: monospace; }
+        .note { color: #6b6f94; font-size: 11px; }
+        button.upload-btn, button.launch-btn {
+            padding: 10px 22px;
+            border-radius: 8px;
+            font-weight: bold;
+            border: none;
+        }
+        button.upload-btn { background-image: none; background-color: #2c2f52; color: #e8e9f5; }
+        button.upload-btn:hover { background-color: #3a3e6e; }
+        button.launch-btn { background-image: none; background-color: #6b3cdc; color: white; }
+        button.launch-btn:hover { background-color: #7d4ff0; }
+        button:disabled { opacity: 0.45; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+    def set_status(self, text):
+        GLib.idle_add(self.status_label.set_text, text)
+
+    def on_upload_clicked(self, _btn):
+        dialog = Gtk.FileChooserDialog(
+            title="Select an ISO image",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN, Gtk.ResponseType.OK,
+        )
+        iso_filter = Gtk.FileFilter()
+        iso_filter.set_name("ISO images")
+        iso_filter.add_pattern("*.iso")
+        dialog.add_filter(iso_filter)
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            self.iso_path = dialog.get_filename()
+            self.file_label.set_text(os.path.basename(self.iso_path))
+            self.launch_btn.set_sensitive(True)
+            self.status_label.set_text("")
+        dialog.destroy()
+
+    def on_launch_clicked(self, _btn):
+        if not self.iso_path:
+            return
+
+        qemu_bin = find_binary("qemu-system-x86_64")
+        viewer_bin = find_binary("remote-viewer")
+
+        missing = []
+        if not qemu_bin:
+            missing.append("qemu-system-x86")
+        if not viewer_bin:
+            missing.append("virt-viewer")
+
+        if missing:
+            self.show_error(
+                "Missing components: {}\n\n"
+                "Install them with:\nsudo apt install {}".format(
+                    ", ".join(missing), " ".join(missing)
+                )
+            )
+            return
+
+        self.launch_btn.set_sensitive(False)
+        self.upload_btn.set_sensitive(False)
+        self.set_status("Starting virtual machine…")
+        threading.Thread(target=self._boot_vm, args=(qemu_bin, viewer_bin), daemon=True).start()
+
+    def _boot_vm(self, qemu_bin, viewer_bin):
+        args = [
+            qemu_bin,
+            "-name", "VirtualX",
+            "-m", "2048",
+            "-smp", "2",
+            "-cdrom", self.iso_path,
+            "-boot", "d",
+            "-vga", "qxl",
+            "-usb",
+            "-device", "usb-tablet",
+            "-spice", "port={},addr=127.0.0.1,disable-ticketing=on".format(SPICE_PORT),
+            "-device", "virtio-serial-pci",
+            "-chardev", "spicevmc,id=vdagent,name=vdagent",
+            "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
+            "-audiodev", "spice,id=snd0",
+            "-device", "ich9-intel-hda",
+            "-device", "hda-output,audiodev=snd0",
+        ]
+
+        if has_kvm():
+            args.insert(1, "-enable-kvm")
+        else:
+            args += ["-accel", "tcg"]
+
+        try:
+            self.qemu_proc = subprocess.Popen(args)
+        except Exception as exc:
+            self.set_status("")
+            GLib.idle_add(self.show_error, "Failed to start QEMU:\n{}".format(exc))
+            GLib.idle_add(self._reset_buttons)
+            return
+
+        self.set_status("Booting… opening display window")
+
+        # Give QEMU a moment to open its SPICE socket before connecting.
+        import time
+        time.sleep(1.2)
+
+        try:
+            self.viewer_proc = subprocess.Popen(
+                [viewer_bin, "spice://127.0.0.1:{}".format(SPICE_PORT)]
+            )
+        except Exception as exc:
+            GLib.idle_add(self.show_error, "Failed to open viewer:\n{}".format(exc))
+            GLib.idle_add(self._reset_buttons)
+            return
+
+        self.set_status("Running — close the VM window to stop.")
+
+        self.viewer_proc.wait()
+        if self.qemu_proc and self.qemu_proc.poll() is None:
+            self.qemu_proc.terminate()
+
+        self.set_status("")
+        GLib.idle_add(self._reset_buttons)
+
+    def _reset_buttons(self):
+        self.launch_btn.set_sensitive(True)
+        self.upload_btn.set_sensitive(True)
+
+    def show_error(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="VirtualX",
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
+    def on_destroy(self, _widget):
+        for proc in (self.viewer_proc, self.qemu_proc):
+            if proc and proc.poll() is None:
+                proc.terminate()
+        Gtk.main_quit()
+
+
+def main():
+    win = VirtualXWindow()
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
